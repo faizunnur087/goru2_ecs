@@ -97,6 +97,19 @@ variable "spring_mongodb_uri" {
   sensitive = true
 }
 
+variable "rds_db_name" {
+  type    = string
+  default = ""
+}
+variable "rds_db_username" {
+  type    = string
+  default = ""
+}
+variable "rds_db_password" {
+  type      = string
+  default   = ""
+  sensitive = true
+}
 
 locals {
   # ECR names must be lowercase alphanumeric and hyphens only
@@ -204,7 +217,6 @@ resource "aws_security_group" "ecs_tasks" {
   lifecycle { create_before_destroy = true }
 }
 
-
 # ── ALB ────────────────────────────────────────────────────────────────────────
 resource "aws_lb" "main" {
   name               = "${local.name_safe}-alb"
@@ -212,3 +224,121 @@ resource "aws_lb" "main" {
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb.id]
   subnets            = data.aws_subnets.default.ids
+}
+
+resource "aws_lb_target_group" "app" {
+  name        = "${local.name_safe}-tg"
+  port        = var.app_port
+  protocol    = "HTTP"
+  vpc_id      = data.aws_vpc.default.id
+  target_type = "ip"
+
+  health_check {
+    path                = var.health_check_path
+    interval            = 30
+    timeout             = 5
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+    matcher             = "200-399"
+  }
+}
+
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.main.arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.app.arn
+  }
+}
+
+# ── IAM ────────────────────────────────────────────────────────────────────────
+resource "aws_iam_role" "ecs_task_execution" {
+  name = "${local.name_safe}-exec-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "ecs-tasks.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_task_execution" {
+  role       = aws_iam_role.ecs_task_execution.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+# ── ECS Task Definition ────────────────────────────────────────────────────────
+resource "aws_ecs_task_definition" "app" {
+  family                   = "${local.name_safe}-task"
+  network_mode             = "awsvpc"
+  requires_compatibilities = ["FARGATE"]
+  cpu                      = "256"
+  memory                   = "512"
+  execution_role_arn       = aws_iam_role.ecs_task_execution.arn
+
+  container_definitions = jsonencode([{
+    name      = local.name_safe
+    image     = var.container_image
+    essential = true
+    portMappings = [{
+      containerPort = var.app_port
+      protocol      = "tcp"
+    }]
+    environment = local.task_environment
+    logConfiguration = {
+      logDriver = "awslogs"
+      options = {
+        awslogs-group         = "/ecs/${local.name_safe}"
+        awslogs-region        = var.aws_region
+        awslogs-stream-prefix = "ecs"
+      }
+    }
+  }])
+}
+
+resource "aws_cloudwatch_log_group" "app" {
+  name              = "/ecs/${local.name_safe}"
+  retention_in_days = 7
+}
+
+# ── ECS Service ────────────────────────────────────────────────────────────────
+resource "aws_ecs_service" "app" {
+  name            = "${local.name_safe}-service"
+  cluster         = aws_ecs_cluster.main.id
+  task_definition = aws_ecs_task_definition.app.arn
+  desired_count   = 1
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets          = data.aws_subnets.default.ids
+    security_groups  = [aws_security_group.ecs_tasks.id]
+    assign_public_ip = true
+  }
+
+  load_balancer {
+    target_group_arn = aws_lb_target_group.app.arn
+    container_name   = local.name_safe
+    container_port   = var.app_port
+  }
+
+  depends_on = [aws_lb_listener.http]
+}
+
+# ── Outputs ────────────────────────────────────────────────────────────────────
+output "alb_dns_name" {
+  value = aws_lb.main.dns_name
+}
+
+output "ecs_cluster_name" {
+  value = aws_ecs_cluster.main.name
+}
+
+output "ecs_service_name" {
+  value = aws_ecs_service.app.name
+}
